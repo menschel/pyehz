@@ -1,3 +1,5 @@
+# iec62056.py 
+# (C) 2017 Patrick Menschel
 import serial
 import logging
 import threading

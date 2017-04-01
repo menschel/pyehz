@@ -1,3 +1,5 @@
+# S0_EHZ.py 
+# (C) 2017 Patrick Menschel
 import logging,datetime,sys,time
 
 class S0_EHZ():
