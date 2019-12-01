@@ -1,12 +1,34 @@
 # iec62056.py 
 # (C) 2017 Patrick Menschel
 import serial
-import logging
 import threading
 import queue
 import time
-import datetime
+from datetime import datetime
 from pprint import pprint
+
+
+import logging
+import os
+from logging.handlers import RotatingFileHandler
+from tempfile import gettempdir
+log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(funcName)s(%(lineno)d) %(message)s')
+
+logFile = os.path.join(gettempdir(),"iec62056.log")
+
+log_handler = RotatingFileHandler(logFile, mode='a', maxBytes=5*1024*1024, 
+                                 backupCount=2, encoding=None, delay=0)
+log_handler.setFormatter(log_formatter)
+#log_handler.setLevel(logging.INFO)
+log_handler.setLevel(logging.DEBUG)
+
+app_log = logging.getLogger('iec62056')
+#app_log.setLevel(logging.INFO)
+app_log.setLevel(logging.DEBUG)
+
+app_log.addHandler(log_handler)
+
+
 
 IEC_62056_STARTCHARACTER = b'/'
 IEC_62056_TRANSMISSIONREQUESTCOMMAND = b'?'
@@ -41,51 +63,81 @@ IEC_62056_REGISTERS = {
                        'Voltage':{'address':0x0,
                                   'length':2,
                                   'unit':'V',
-                                  'scale':'04.1f'},
+                                  'scale':'04.1f',
+                                  'compu_method':lambda x:int(x)/10
+                                  },
                        'Current':{'address':0x1,
                                   'length':2,
                                   'unit':'A',
-                                  'scale':'04.1f'},
+                                  'scale':'04.1f',
+                                  'compu_method':lambda x:int(x)/10
+                                  },
                         'Frequency':{'address':0x2,
                                       'length':2,
                                       'unit':'Hz',
-                                      'scale':'04.1f'},
+                                      'scale':'04.1f',
+                                      'compu_method':lambda x:int(x)/10
+                                      },
                        'Active Power':{'address':0x3,
                                        'length':2,
-                                       'unit':'kW',
-                                       'scale':'04.2f'},    
+                                       'unit':'W',
+                                       'scale':'04.2f',
+                                       'compu_method':lambda x:int(x)*10 #10W Minimum, current must be >0.5A for anything to display here
+                                       },    
                         'Reactive Power':{'address':0x4,
                                           'length':2,
                                           'unit':'VAr',
-                                          'scale':'04.2f'},      
+                                          'scale':'04.2f',
+                                          'compu_method':lambda x:int(x)*10 #10VAr Minimum to display
+                                          },      
                         'Apparent Power':{'address':0x5,
                                           'length':2,
                                           'unit':'VA',
-                                          'scale':'04.2f'},    
+                                          'scale':'04.2f',
+                                          'compu_method':lambda x:int(x)*10
+                                          },    
                          'Active Energy':{'address':0x10,
                                           'length':4,
                                           'unit':'Wh',
-                                          'scale':'08f'},  
-                        'Time':{'address':0x31, 
+                                          'scale':'08f',
+                                          'compu_method':lambda x:int(x)
+                                          },                           
+                        'Time':{'address':0x31,
                                 'length':2,
                                 'unit':'',
-                                'scale':''},                        
+                                'scale':'',
+                                'compu_method':lambda x:iec1107_time_from_datetime(x)
+                                },             
+#Note: Time follows format described in https://www.gavilar.nl/files/uniflo-1200-1107-option-card-protocol_1521630426_d3a4f02a.pdf Page 3 Setting the clock
+#The week day and week number components of a C003 value are ignored, and should preferably be 0.
+#E.g. to set the clock to December 16 2008, 12:27:02, send this:
+#<SOH>W2<STX>C003(0812161227020000)<ETX><BCC>
+#01 57 32 02 43 30 30 33 28 30 38 31 32 31 36 31 32 32 37 30 32 30 30 30 30 29 03 1d   
+# Comment: This is partly wrong, what is found on DRS110M is YYMMDDXXHHMMSS where XX is unknown maybe timezone or else  
                         'Temperature':{'address':0x32,
                                        'length':2,
                                        'unit':'°C',
-                                       'scale':''},      
-                        'Serial Port':{'address':0x34,
+                                       'scale':'',
+                                       'compu_method':lambda x:drs110m_fix_temperature_format(x)#["{0:02X}".format(ord(y)) for y in x]#int(x)
+                                       },      
+                        'Serial Port':{'address':0x34, #<-- SerialNO according to BGE Tool
                                        'length':6,
                                        'unit':'',
-                                       'scale':''},
+                                       'scale':'',
+                                       'compu_method':lambda x:int(x)
+                                       },
                         'Baudrate':{'address':0x35,
                                     'length':2,
                                     'unit':'',
-                                    'scale':''},                       
+                                    'scale':'',
+                                    'compu_method':lambda x:IEC_62056_MODE_A_BAUDRATE_IDENTIFIERS.get(int(x))
+                                    },                       
                          'Meter ID':{'address':0x36,
                                      'length':6,
                                      'unit':'',
-                                     'scale':''},
+                                     'scale':'',
+                                     'compu_method':lambda x:int(x)
+                                     },
 #                         'Password':{'address':0x37,
 #                                     'length':4,
 #                                     'unit':'',
@@ -99,10 +151,10 @@ IEC_62056_REGISTERS = {
                        
 
 IEC_62056_MODE_A_BAUDRATE_IDENTIFIERS = {
-                                         '1':1200,
-                                         '2':2400,
-                                         '3':4800,
-                                         '4':9600,#DRS110M
+                                         1:1200,
+                                         2:2400,
+                                         3:4800,
+                                         4:9600,#DRS110M
                                          }
 
 IEC_62056_MODE_B_BAUDRATE_IDENTIFIERS = {'A':300,
@@ -203,7 +255,8 @@ def iec_62056_interpret_identification_message(msg):
             'max_baudrate':max_baudrate,
             'identification':identification,
             'protocol_mode':protocol_mode,
-            'baudrate_variable':baudrate_variable}
+            'baudrate_variable':baudrate_variable,
+            'raw_data':msg}
     
 def print_iec_62056_identification(iec_62056_identification):
     print("""Manufacturer {manufacturer}
@@ -217,12 +270,15 @@ Max Baudrate {reactiontime}""".format_map(iec_62056_identification))
 def iec_62056_interpret_data_message(msg):
     data = msg[1:-2].decode().rstrip(')')
     key,val = data.split('(')
-    intkey = int(key,16)
-    try:
-        intval = int(val)
-    except ValueError:
-        intval = val
-    return intkey,intval
+    return key,val
+#     print("before format {0} , {1}".format(key,val))
+#     intkey = int(key,16)
+#     try:
+#         intval = int(val)
+#     except ValueError:
+#         intval = val
+#     print("after format {0} , {1}".format(intkey,intval))
+#     return intkey,intval
 
 def iec_62056_interpret_obis_msg(msg):
     obis_data = {}
@@ -337,8 +393,34 @@ def iec_62056_generate_r1_obis_message(obis_code):
     return msg
 
 
+iec1107_time_format = "%y%m%d0%w%H%M%S" #<-- is this really IEC1107 or are we just expect drs110m to work according to iec1107
+def iec1107_time_from_datetime(s):
+    ts = datetime.strptime(s,iec1107_time_format)
+    print("time conversion {0} >> {1}".format(s, ts))
+    return ts
+
+def datetime_to_iec1107_time(dt_obj):
+    s = dt_obj.strftime(iec1107_time_format)
+    print("time conversion {0} >> {1}".format(dt_obj, s))
+    return s
 
 
+def drs110m_fix_temperature_format(s):
+    """reverse engineering the temp output via rs485, I found a SW Bug.
+       observing the output 30 30 31 36 or 0016 as string counting up in the last value moving past the 39 boundary
+       to 3A...to 3F and then rolling over the third value to 30 30 32 30 leads to the assumption the program takes
+       the temperature value in deg C as hex() as a right nibble and place 3 as the left nibble, therefore causing this rollover
+       at room temperature the value 0x16 translates to 22degC, still a degree to low but at least in the right range.
+       After a while the value assumes 0x20 so 32degC which are possible for a working device. 
+       Todo: wrap this back the right way.
+       @param s:the string coming from drs110m in ASCII
+       @return: the correct degC value as int 
+    """
+    h = "".join(["{0:X}".format(ord(x)-0x30) for x in s])#join the numbers to a real hexadecimal number
+    i = int(h,16)
+    print(s,h,i)
+    return i
+    
 
 
 class iec62056():
@@ -346,8 +428,7 @@ class iec62056():
         """
         @param ser: Serial Connection, can be an serial.Serial object or a string to the port
         """
-        self._init_logger()
-        self._log_debug('Init with ser {0} ({1}), portsettings {2}'.format(port,type(port),portsettings))
+        app_log.debug('Init with ser {0} ({1}), portsettings {2}'.format(port,type(port),portsettings))
         self.port = port
         if portsettings:
             self.portsettings = portsettings            
@@ -376,47 +457,15 @@ class iec62056():
         self.rxhandler.setDaemon(True)
         if self.ser:
             self.start_serial()
-        self._log_info('Init Complete')
-        
-    def _init_logger(self):
-        self._logger = logging.getLogger('iec62056')
-        self._logger.setLevel(logging.DEBUG)
-        self._fh = logging.FileHandler('iec62056.log')
-        #self._fh.setLevel(logging.DEBUG)
-        #self._fh.setLevel(logging.INFO)
-        self._fh.setLevel(logging.ERROR)
-        self._ch = logging.StreamHandler()
-        self._ch.setLevel(logging.ERROR)
-        self._formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        self._fh.setFormatter(self._formatter)
-        self._ch.setFormatter(self._formatter)
-        self._logger.addHandler(self._fh)
-        self._logger.addHandler(self._ch)
-        self._log_info('Logger has been initialized')
-        return
-    
-    def _log_info(self,msg):
-        if self._logger:
-            self._logger.info(msg)
-        return
-                
-    def _log_error(self,msg):
-        if self._logger:
-            self._logger.error(msg)
-        return
-    
-    def _log_debug(self,msg):
-        if self._logger:
-            self._logger.debug(msg)
-        return     
+        app_log.info('Init Complete')
     
     def handlerx(self):
-        self._log_debug('handlerx started')
+        app_log.debug('handlerx started')
         rxbuff = bytearray()
         while self.ser.isOpen():
             msg = self.ser.read(64)
             if msg:
-                self._log_debug('Serial Read {0}'.format(' '.join(['{0:02x}'.format(x) for x in msg])))
+                app_log.debug('Serial Read {0}'.format(' '.join(['{0:02x}'.format(x) for x in msg])))
                 rxbuff.extend(msg)
                 if rxbuff[0] == IEC_62056_FRAMESTARTCHARACTER[0]:
                     if rxbuff[-2] == IEC_62056_BLOCKENDCHARACTER[0]:
@@ -432,7 +481,7 @@ class iec62056():
     
     
     def configure_serial(self,port=None,portsettings=None):
-        self._log_debug('Configure Serial Port: {0} Settings:{1}'.format(port,portsettings))
+        app_log.debug('Configure Serial Port: {0} Settings:{1}'.format(port,portsettings))
         if not self.is_started:
             if port:
                 self.port=port
@@ -445,15 +494,17 @@ class iec62056():
                 try:
                     self.ser = serial.Serial(port=self.port,baudrate=self.portsettings['baudrate'],bytesize=self.portsettings['bytesize'],parity=self.portsettings['parity'],stopbits=self.portsettings['stopbits'],timeout=self.portsettings['timeout'])
                 except serial.SerialException:
-                    self._log_error('SerialException - Could not open Serial Port {0}'.format(port))
+                    app_log.error('SerialException - Could not open Serial Port {0}'.format(port))
                     raise ValueError('Could not open Serial Port {0}'.format(port))            
         return
     
 
     def change_baudrate_serial(self,baudrate):
-        self._log_debug('Set Serial Baudrate {0}'.format(baudrate))
-        self.ser.setBaudrate(baudrate=baudrate)
-        self._log_debug('Baudrate now is {0}'.format(self.ser.baudrate))
+        app_log.debug('Set Serial Baudrate {0}'.format(baudrate))
+        #self.ser.setBaudrate(baudrate=baudrate) # not working any more
+        #self.ser.baudrate=baudrate <-- worked but seems nasty
+        self.ser.baudrate(baudrate)
+        app_log.debug('Baudrate now is {0}'.format(self.ser.baudrate))
         return
     
     def start_serial(self):
@@ -471,19 +522,19 @@ class iec62056():
     def on_iec62056_message(self,msg):
 
         if iec_62056_is_identification_message(msg):
-            self._log_debug('found identification message {0}'.format(msg))
+            app_log.debug('found identification message {0}'.format(msg))
             self.on_identification_message(msg)
 
         elif iec_62056_is_acknowledge_message(msg):
-            self._log_debug('found ack message {0}'.format(msg))
+            app_log.debug('found ack message {0}'.format(msg))
             self.on_ack_message(msg)
 
         elif iec_62056_is_data_message(msg):
-            self._log_debug('found data message {0}'.format(msg))
+            app_log.debug('found data message {0}'.format(msg))
             self.on_data_message(msg)
 
         elif iec_62056_is_programming_command_message(msg):
-            self._log_debug('found programming message {0}'.format(msg))
+            app_log.debug('found programming message {0}'.format(msg))
             self.on_programming_message(msg)
         else:
             print('No corresponding message {0}'.format(' '.join(['{0:02x}'.format(x) for x in msg])))    
@@ -515,12 +566,12 @@ class iec62056():
     
     
     def handletx(self):
-        self._log_debug('handletx started')
+        app_log.debug('handletx started')
         while self.ser.isOpen():
             try:
                 nexttxmessage = self.txqueue.get(1)
                 self.ser.write(nexttxmessage)
-                self._log_debug('Serial Write {0}'.format(' '.join(['{0:02x}'.format(x) for x in nexttxmessage])))
+                app_log.debug('Serial Write {0}'.format(' '.join(['{0:02x}'.format(x) for x in nexttxmessage])))
             except queue.Empty:
                 pass
         return
@@ -530,7 +581,7 @@ class iec62056():
         return
     
     def start_communication(self,device_address=None):
-        self._log_info('start_communication to {0}'.format(device_address))
+        app_log.info('start_communication to {0}'.format(device_address))
         self.ser.flushInput()#discard anything that is there
         if device_address == None:
             if self.device_address:
@@ -544,48 +595,48 @@ class iec62056():
                 self.device_address = device_address
             except queue.Empty:
                 resp = None
-                self._log_error('Timeout on Start Communication message - next try')
+                app_log.error('Timeout on Start Communication message - next try')
                 self.transmit(msg)                          
         return
     
     def acknowledge_option_select(self,protocol=0,baudrate=None,mode=0):
         msg = iec_62056_generate_acknowledge_option_select_message(protocol=0, mode=mode,baudrate=baudrate)
-        self._log_debug('sending ack_option_switch_message for protocol {0}, baudrate {1}, mode {2}'.format(protocol,baudrate,mode))
+        app_log.debug('sending ack_option_switch_message for protocol {0}, baudrate {1}, mode {2}'.format(protocol,baudrate,mode))
         self.transmit(msg)
-        self._log_debug('ack_option_switch_message sent')
+        app_log.debug('ack_option_switch_message sent')
         return
     
     def start_programming_mode_with_password(self,password=0):
-        self._log_info('start_programming_mode_with_password {0}'.format(password))
+        app_log.info('start_programming_mode_with_password {0}'.format(password))
         msg = iec_62056_generate_acknowledge_option_select_message(protocol=0, mode=1)
         self.transmit(msg)
-        self._log_debug('ack_option_switch_message sent')
+        app_log.debug('ack_option_switch_message sent')
         try:
             self.programm_queue.get(timeout=self.timeout)
-            self._log_debug('password_request received')
-            msg = iec_62056_generate_p1_message(0)
+            app_log.debug('password_request received')
+            msg = iec_62056_generate_p1_message(password)
             self.transmit(msg)
-            self._log_debug('password_message sent')
+            app_log.debug('password_message sent')
             self.acknowledge_queue.get(timeout=self.timeout)
-            self._log_debug('password_response received')
+            app_log.debug('password_response received')
         except queue.Empty:
-            self._log_error('Timeout on P1 message')
+            app_log.error('Timeout on P1 message')
         return
        
-    def read_register(self,reg_address):
-        msg = iec_62056_generate_r1_message(reg_address)
+    def read_r1(self,addr):
+        msg = iec_62056_generate_r1_message(addr)
         self.transmit(msg)
         try:
             data = self.data_queue.get(timeout=self.timeout)
         except queue.Empty:
             data = None
-            self._log_error('No Response from Register {0}'.format(reg_address))        
+            app_log.error('No Response from Register {0}'.format(addr))        
         return data
     
-    def simple_read_register(self,reg_address):
-        self.start_programming_mode_with_password()
-        data = self.read_register(reg_address)
-        return data
+#     def simple_read_register(self,reg_address):
+#         self.start_programming_mode_with_password()
+#         data = self.read_register(reg_address)
+#         return data
     
     def log_off(self):
         msg = iec_62056_generate_b0_message()
@@ -594,74 +645,65 @@ class iec62056():
     
     
     def get_value_r1(self,valname,reg_dict=IEC_62056_REGISTERS):
+        """ usage simplification """
         reg = reg_dict[valname]
         reg.update({'raw_data':None,
                     'value':None,
                     })
         addr = reg['address']
-        data = self.read_register(addr)
+        data = self.read_r1(addr=addr)
+        #print(valname,addr,data)
         if data:
             reg.update({'raw_data':data})
             key,val = iec_62056_interpret_data_message(data)
-            if key != addr:
-                print('Protocol Error - expected{0} but found {1}'.format(addr,key))
-            signal_scaling = reg['scale']
-            if '.' in signal_scaling:
-                idx = signal_scaling.index('.')
-                idx2 = signal_scaling.index('f')
-                signal_exponent = int(signal_scaling[idx+1:idx2])
-                signal_divisor = 1
-                for i in range(signal_exponent):
-                    signal_divisor *= 10
-                val /= signal_divisor
-            reg.update({'value':val})    
-            reg.update({'time_stamp':datetime.datetime.now()})    
+            valaddr = int(key,16)
+            if valaddr != addr:
+                print('Protocol Error - expected{0} but found {1}'.format(addr,valaddr))
+            cm = reg['compu_method']
+            v = cm(val)
+            reg.update({'value':v})    
+            reg.update({'time_stamp':datetime.now()})    
         return reg
     
-    def print_value(self,valname):
-        reg = self.get_value_r1(valname)
-        if reg['raw_data']:
-            val_as_str = '{value}{unit}'.format_map(reg)
-            print('{0}:{1}'.format(valname, val_as_str))
-        return
-    
-    def printstr_value(self,valname):
-        reg = self.get_value_r1(valname)
-        if reg['raw_data']:
-            val_as_str = '{value}{unit}'.format_map(reg)
-            ret = '{0}:{1}'.format(valname, val_as_str)
-        else:
-            ret = '{0}:{1}'.format(valname, "None")
-        return ret
-        
-    
-    def print_registers(self,reg_dict=IEC_62056_REGISTERS):
-        self.start_programming_mode_with_password()
-        for valname in reg_dict:
-            self.print_value(valname)
-        self.log_off()
-        return        
-    
-    def prints_registers(self,reg_dict=IEC_62056_REGISTERS):
-        self.start_programming_mode_with_password()
-        ret = []
-        for valname in reg_dict:
-            ret.append(self.print_value(valname))
-        self.log_off()
-        return ret               
+#     def print_value(self,valname):
+#         reg = self.get_value_r1(valname)
+#         if reg['raw_data']:
+#             val_as_str = '{value}{unit}'.format_map(reg)
+#             print('{0}:{1}'.format(valname, val_as_str))
+#         return
+#     
+#     def printstr_value(self,valname):
+#         reg = self.get_value_r1(valname)
+#         if reg['raw_data']:
+#             val_as_str = '{value}{unit}'.format_map(reg)
+#             ret = '{0}:{1}'.format(valname, val_as_str)
+#         else:
+#             ret = '{0}:{1}'.format(valname, "None")
+#         return ret             
         
     def get_meter_information(self):
         with self.mutex:
             mi = self.meter_objs.copy()
         return mi    
     
-    def clear_active_energy(self):
-        self.start_programming_mode_with_password()
-        msg = iec_62056_generate_w1_message(address=0x40,valuetowrite='00000000')
+#     def clear_active_energy(self):
+#         self.start_programming_mode_with_password()
+#         msg = iec_62056_generate_w1_message(address=0x40,valuetowrite='00000000')
+#         self.transmit(msg)
+#         app_log.debug('clear active energy sent')
+#         self.acknowledge_queue.get(timeout=self.timeout)
+#         app_log.debug('acknowledge received')
+#         return
+    
+    def write_w1(self,addr,val):
+        msg = iec_62056_generate_w1_message(address=addr,valuetowrite=val)
         self.transmit(msg)
-        self._log_debug('clear active energy sent')
-        self.acknowledge_queue.get(timeout=self.timeout)
-        self._log_debug('acknowledge received')
+        app_log.debug('write_w1 {0} {1}'.format(addr,val))
+        try:
+            self.acknowledge_queue.get(timeout=self.timeout)
+            app_log.debug('acknowledge received')
+        except queue.Empty:
+            app_log.debug('timeout while waiting for acknowledge')
         return
     
     def get_obis_data_frame(self):
@@ -672,7 +714,7 @@ class iec62056():
     def request_r5_p01(self):
         msg = iec_62056_generate_r5_obis_message('P.1')
         self.transmit(msg)
-        self._log_debug('requested R5 P.01')
+        app_log.debug('requested R5 P.01')
         ret = self.data_queue.get(timeout=5)
         print(ret)
         return ret
@@ -680,7 +722,7 @@ class iec62056():
     def request_r5_p98(self):
         msg = iec_62056_generate_r5_obis_message('P.98')
         self.transmit(msg)
-        self._log_debug('requested R5 P.98')
+        app_log.debug('requested R5 P.98')
         ret = self.data_queue.get(timeout=5)
         print(ret)
         return ret
@@ -688,7 +730,7 @@ class iec62056():
     def request_r1_180(self):
         msg = iec_62056_generate_r1_obis_message('1.8.0')
         self.transmit(msg)
-        self._log_debug('requested R1 1.8.0')
+        app_log.debug('requested R1 1.8.0')
         ret = self.data_queue.get(timeout=5)
         print(ret)
         return ret
@@ -708,6 +750,7 @@ class drs110m():
             self.iec62056_dev.configure_serial(portsettings=self.portsettings)
             self.iec62056_dev.start_serial()        
         self.device_address = device_address
+        self.password = 0
         if regs:
             self.reg_dict = {}
             for reg in regs:
@@ -718,15 +761,23 @@ class drs110m():
         
     def start_communication(self):
         self.iec62056_dev.start_communication(device_address=self.device_address)
-        self.iec62056_dev.start_programming_mode_with_password()
+        return
+    
+    def start_programming_mode(self):
+        self.iec62056_dev.start_programming_mode_with_password(password=self.password)
         return
     
     def update_values(self):
         self.start_communication()
+        self.start_programming_mode()
         for valname in self.reg_dict:
             reg = self.iec62056_dev.get_value_r1(valname)
             if reg['raw_data']:
                 self.reg_values.update({valname:reg})
+        #TODO: make this nice later
+        self.reg_values.update({"calc_active_energy":{"value":self.reg_values["Voltage"]["value"] * self.reg_values["Current"]["value"],
+                                                      "unit":"W"},
+                                })
         self.log_off()
         return True
     
@@ -736,6 +787,7 @@ class drs110m():
     
     def get_value(self,valname):
         return {valname:self.reg_values[valname]}
+     
     
     def printstr_value(self,valname):
         val = self.get_value(valname)
@@ -747,6 +799,38 @@ class drs110m():
         for val in self.reg_values:
             if val:
                 print(self.printstr_value(val))
+    
+    def write_reg(self,addr,val):
+        return self.iec62056_dev.write_w1(addr=addr,val=val)
+    
+    def read_reg(self,addr):
+        pass
+    
+    def set_clock(self):
+        #TODO: change all functions not to do the 
+        self.start_communication()
+        self.start_programming_mode()
+        val = datetime_to_iec1107_time(datetime.now())
+        self.write_reg(addr=0x31, val=val)
+        #val2 = self.read_reg(addr=0x31)
+        #print(val,val2)
+        self.log_off()
+        
+        
+    def get_clock(self):
+        pass
+        
+    def reset_energy(self):
+        self.start_communication()
+        self.start_programming_mode()
+        self.write_reg(addr=0x40, val="00000000")
+        self.log_off()
+        
+    def set_temperature(self,t):#this is a stupid idea to figure out the temperature format used
+        self.start_communication()
+        self.start_programming_mode()
+        self.write_reg(addr=0x32, val="{0:04d}".format(t))
+        self.log_off()
                 
                 
 class pafal():
@@ -790,10 +874,13 @@ class pafal():
         
                 
     
-def selftest(port,con_type,cmd,meterid):  
+def selftest(port,cmd,meterid):  
     iec62056_obj = iec62056(port=port)    
     if cmd == 'readout_drs110m':        
-        drs110m_dev = drs110m(iec62056_dev=iec62056_obj,device_address=meterid,regs=['Time','Active Energy','Active Power'])
+        drs110m_dev = drs110m(iec62056_dev=iec62056_obj,
+                              device_address=meterid,
+                              #regs=['Time','Active Energy','Active Power']
+                              )
         drs110m_dev.update_values()      
         drs110m_dev.print_all_values()
         
@@ -801,24 +888,49 @@ def selftest(port,con_type,cmd,meterid):
         pafal_dev = pafal(iec62056_dev=iec62056_obj)
         pafal_dev.start_communication()
         pprint(pafal_dev.obis_data)
+        
+        
+    elif cmd == 'drs110m_set_clock':
+        drs110m_dev = drs110m(iec62056_dev=iec62056_obj,
+                              device_address=meterid,
+                              #regs=['Time','Active Energy','Active Power']
+                              )
+        drs110m_dev.set_clock()
+        
+    elif cmd == 'drs110m_reset_energy':
+        drs110m_dev = drs110m(iec62056_dev=iec62056_obj,
+                              device_address=meterid,
+                              #regs=['Time','Active Energy','Active Power']
+                              )
+        drs110m_dev.reset_energy()
+        
+    elif cmd == 'drs110m_set_temperture':
+        drs110m_dev = drs110m(iec62056_dev=iec62056_obj,
+                              device_address=meterid,
+                              #regs=['Time','Active Energy','Active Power']
+                              )
+        drs110m_dev.set_temperature(t=20)
+        
+    elif cmd == "test_temperature_correction":
+        drs110m_fix_temperature_format("001;")
+
+        
 
     return        
     
 if __name__ == '__main__':
     from optparse import OptionParser
     parser = OptionParser()
-    parser.add_option("-c", "--command", dest="command", default='readout_pafal',
+    parser.add_option("-c", "--command", dest="command", default='readout_drs110m',
                       help="COMMAND to execute", metavar="COMMAND")
     parser.add_option("-p", "--port", dest="port", default='/dev/ttyUSB0',
-                      help="PORT device to use", metavar="PORT")
-    parser.add_option("-t", "--type", dest="type", default='RS485',
-                      help="TYPE of PORT, can be RS485 or IR", metavar="TYPE")    
+                      help="PORT device to use", metavar="PORT")  
     parser.add_option("-i", "--meterid", dest="meterid", type="int", default=1613300153,
                       help="METERID to start communication with", metavar="METERID")
     
     (options, args) = parser.parse_args()
  
-    selftest(port=options.port,con_type=options.type,cmd=options.command,meterid=options.meterid)
+    selftest(port=options.port,cmd=options.command,meterid=options.meterid)
 
 
     
